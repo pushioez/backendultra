@@ -31,14 +31,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=keyboard,
     )
 
-
-def main() -> None:
+def create_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.run_polling(close_loop=False)
+    return app
+
+
+def run_polling_blocking() -> None:
+    """
+    Runs the bot in the current thread.
+    When called from a background thread, we disable signal handling.
+    """
+    app = create_application()
+    app.run_polling(stop_signals=None)
+
+
+def main() -> None:
+    run_polling_blocking()
 
 
 if __name__ == "__main__":

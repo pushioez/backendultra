@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Literal, Optional
 
 import httpx
+import threading
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -19,9 +20,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "salon_bookings.sqlite3"
+DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "salon_bookings.sqlite3")))
 FRONTEND_DIR = BASE_DIR / "frontend"
 HAS_FRONTEND = FRONTEND_DIR.exists()
+
+# Ensure DB directory exists (helps on Render when using mounted disks)
+try:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 
 SLOT_RANGES: List[str] = [
@@ -34,7 +41,21 @@ SLOT_RANGES: List[str] = [
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    # Render may have restricted write access in the project folder.
+    # If the configured DB_PATH is not writable, fall back to /tmp.
+    candidate_paths = [DB_PATH, Path("/tmp/salon_bookings.sqlite3")]
+    last_err: Optional[Exception] = None
+    conn = None
+    for p in candidate_paths:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(p)
+            break
+        except Exception as e:  # pragma: no cover
+            last_err = e
+            conn = None
+    if conn is None:
+        raise RuntimeError(f"Could not open SQLite DB. Last error: {last_err}")
     try:
         conn.row_factory = sqlite3.Row
         yield conn
@@ -70,6 +91,33 @@ def init_db() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # If Background Worker is not available on Render (paid option),
+    # we can run the Telegram bot inside the web service process.
+    should_run_bot = bool(TELEGRAM_BOT_TOKEN) and os.getenv(
+        "RUN_TELEGRAM_BOT_IN_WEB", "1"
+    ).lower() not in {"0", "false", "no"}
+    if should_run_bot and not getattr(app.state, "bot_thread_started", False):
+        try:
+            try:
+                from backend.bot import run_polling_blocking
+            except Exception:
+                # When Render Root Directory is set to "backend",
+                # the module is imported as "bot" instead.
+                from bot import run_polling_blocking
+
+            def _bot_runner():
+                try:
+                    run_polling_blocking()
+                except Exception:
+                    # Don't crash the web service if bot fails.
+                    return
+
+            t = threading.Thread(target=_bot_runner, daemon=True)
+            t.start()
+            app.state.bot_thread_started = True
+        except Exception:
+            # Ignore bot start errors; /start won't work then.
+            pass
     yield
 
 
